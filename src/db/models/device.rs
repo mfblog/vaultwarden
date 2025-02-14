@@ -1,7 +1,10 @@
 use chrono::{NaiveDateTime, Utc};
+use derive_more::{Display, From};
+use serde_json::Value;
 
-use crate::{crypto, CONFIG};
-use core::fmt;
+use super::{AuthRequest, UserId};
+use crate::{crypto, util::format_date, CONFIG};
+use macros::IdFromParam;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -9,26 +12,25 @@ db_object! {
     #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid, user_uuid))]
     pub struct Device {
-        pub uuid: String,
+        pub uuid: DeviceId,
         pub created_at: NaiveDateTime,
         pub updated_at: NaiveDateTime,
 
-        pub user_uuid: String,
+        pub user_uuid: UserId,
 
         pub name: String,
-        pub atype: i32,         // https://github.com/bitwarden/server/blob/master/src/Core/Enums/DeviceType.cs
+        pub atype: i32,         // https://github.com/bitwarden/server/blob/dcc199bcce4aa2d5621f6fab80f1b49d8b143418/src/Core/Enums/DeviceType.cs
         pub push_uuid: Option<String>,
         pub push_token: Option<String>,
 
         pub refresh_token: String,
-
         pub twofactor_remember: Option<String>,
     }
 }
 
 /// Local methods
 impl Device {
-    pub fn new(uuid: String, user_uuid: String, name: String, atype: i32) -> Self {
+    pub fn new(uuid: DeviceId, user_uuid: UserId, name: String, atype: i32) -> Self {
         let now = Utc::now().naive_utc();
 
         Self {
@@ -47,6 +49,18 @@ impl Device {
         }
     }
 
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.uuid,
+            "name": self.name,
+            "type": self.atype,
+            "identifier": self.push_uuid,
+            "creationDate": format_date(&self.created_at),
+            "isTrusted": false,
+            "object":"device"
+        })
+    }
+
     pub fn refresh_twofactor_remember(&mut self) -> String {
         use data_encoding::BASE64;
         let twofactor_remember = crypto::encode_random_bytes::<180>(BASE64);
@@ -59,12 +73,7 @@ impl Device {
         self.twofactor_remember = None;
     }
 
-    pub fn refresh_tokens(
-        &mut self,
-        user: &super::User,
-        orgs: Vec<super::UserOrganization>,
-        scope: Vec<String>,
-    ) -> (String, i64) {
+    pub fn refresh_tokens(&mut self, user: &super::User, scope: Vec<String>) -> (String, i64) {
         // If there is no refresh token, we create one
         if self.refresh_token.is_empty() {
             use data_encoding::BASE64URL;
@@ -72,13 +81,20 @@ impl Device {
         }
 
         // Update the expiration of the device and the last update date
-        let time_now = Utc::now().naive_utc();
-        self.updated_at = time_now;
+        let time_now = Utc::now();
+        self.updated_at = time_now.naive_utc();
 
-        let orgowner: Vec<_> = orgs.iter().filter(|o| o.atype == 0).map(|o| o.org_uuid.clone()).collect();
-        let orgadmin: Vec<_> = orgs.iter().filter(|o| o.atype == 1).map(|o| o.org_uuid.clone()).collect();
-        let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
-        let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
+        // ---
+        // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
+        // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
+        // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
+        // ---
+        // fn arg: members: Vec<super::Membership>,
+        // ---
+        // let orgowner: Vec<_> = members.iter().filter(|m| m.atype == 0).map(|o| o.org_uuid.clone()).collect();
+        // let orgadmin: Vec<_> = members.iter().filter(|m| m.atype == 1).map(|o| o.org_uuid.clone()).collect();
+        // let orguser: Vec<_> = members.iter().filter(|m| m.atype == 2).map(|o| o.org_uuid.clone()).collect();
+        // let orgmanager: Vec<_> = members.iter().filter(|m| m.atype == 3).map(|o| o.org_uuid.clone()).collect();
 
         // Create the JWT claims struct, to send to the client
         use crate::auth::{encode_jwt, LoginJwtClaims, DEFAULT_VALIDITY, JWT_LOGIN_ISSUER};
@@ -93,11 +109,16 @@ impl Device {
             email: user.email.clone(),
             email_verified: !CONFIG.mail_enabled() || user.verified_at.is_some(),
 
-            orgowner,
-            orgadmin,
-            orguser,
-            orgmanager,
-
+            // ---
+            // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
+            // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
+            // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
+            // See: https://github.com/dani-garcia/vaultwarden/issues/4156
+            // ---
+            // orgowner,
+            // orgadmin,
+            // orguser,
+            // orgmanager,
             sstamp: user.security_stamp.clone(),
             device: self.uuid.clone(),
             scope,
@@ -106,8 +127,46 @@ impl Device {
 
         (encode_jwt(&claims), DEFAULT_VALIDITY.num_seconds())
     }
+
+    pub fn is_push_device(&self) -> bool {
+        matches!(DeviceType::from_i32(self.atype), DeviceType::Android | DeviceType::Ios)
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.push_uuid.is_some()
+    }
 }
 
+pub struct DeviceWithAuthRequest {
+    pub device: Device,
+    pub pending_auth_request: Option<AuthRequest>,
+}
+
+impl DeviceWithAuthRequest {
+    pub fn to_json(&self) -> Value {
+        let auth_request = match &self.pending_auth_request {
+            Some(auth_request) => auth_request.to_json_for_pending_device(),
+            None => Value::Null,
+        };
+        json!({
+            "id": self.device.uuid,
+            "name": self.device.name,
+            "type": self.device.atype,
+            "identifier": self.device.push_uuid,
+            "creationDate": format_date(&self.device.created_at),
+            "devicePendingAuthRequest": auth_request,
+            "isTrusted": false,
+            "object": "device",
+        })
+    }
+
+    pub fn from(c: Device, a: Option<AuthRequest>) -> Self {
+        Self {
+            device: c,
+            pending_auth_request: a,
+        }
+    }
+}
 use crate::db::DbConn;
 
 use crate::api::EmptyResult;
@@ -135,7 +194,7 @@ impl Device {
         }
     }
 
-    pub async fn delete_all_by_user(user_uuid: &str, conn: &mut DbConn) -> EmptyResult {
+    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(devices::table.filter(devices::user_uuid.eq(user_uuid)))
                 .execute(conn)
@@ -143,7 +202,7 @@ impl Device {
         }}
     }
 
-    pub async fn find_by_uuid_and_user(uuid: &str, user_uuid: &str, conn: &mut DbConn) -> Option<Self> {
+    pub async fn find_by_uuid_and_user(uuid: &DeviceId, user_uuid: &UserId, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::uuid.eq(uuid))
@@ -154,7 +213,17 @@ impl Device {
         }}
     }
 
-    pub async fn find_by_user(user_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+    pub async fn find_with_auth_request_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<DeviceWithAuthRequest> {
+        let devices = Self::find_by_user(user_uuid, conn).await;
+        let mut result = Vec::new();
+        for device in devices {
+            let auth_request = AuthRequest::find_by_user_and_requested_device(user_uuid, &device.uuid, conn).await;
+            result.push(DeviceWithAuthRequest::from(device, auth_request));
+        }
+        result
+    }
+
+    pub async fn find_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::user_uuid.eq(user_uuid))
@@ -164,7 +233,7 @@ impl Device {
         }}
     }
 
-    pub async fn find_by_uuid(uuid: &str, conn: &mut DbConn) -> Option<Self> {
+    pub async fn find_by_uuid(uuid: &DeviceId, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::uuid.eq(uuid))
@@ -174,7 +243,7 @@ impl Device {
         }}
     }
 
-    pub async fn clear_push_token_by_uuid(uuid: &str, conn: &mut DbConn) -> EmptyResult {
+    pub async fn clear_push_token_by_uuid(uuid: &DeviceId, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::update(devices::table)
                 .filter(devices::uuid.eq(uuid))
@@ -193,7 +262,7 @@ impl Device {
         }}
     }
 
-    pub async fn find_latest_active_by_user(user_uuid: &str, conn: &mut DbConn) -> Option<Self> {
+    pub async fn find_latest_active_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::user_uuid.eq(user_uuid))
@@ -203,7 +272,8 @@ impl Device {
                 .from_db()
         }}
     }
-    pub async fn find_push_devices_by_user(user_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+
+    pub async fn find_push_devices_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::user_uuid.eq(user_uuid))
@@ -214,7 +284,7 @@ impl Device {
         }}
     }
 
-    pub async fn check_user_has_push_device(user_uuid: &str, conn: &mut DbConn) -> bool {
+    pub async fn check_user_has_push_device(user_uuid: &UserId, conn: &mut DbConn) -> bool {
         db_run! { conn: {
             devices::table
             .filter(devices::user_uuid.eq(user_uuid))
@@ -227,60 +297,60 @@ impl Device {
     }
 }
 
+#[derive(Display)]
 pub enum DeviceType {
+    #[display("Android")]
     Android = 0,
+    #[display("iOS")]
     Ios = 1,
+    #[display("Chrome Extension")]
     ChromeExtension = 2,
+    #[display("Firefox Extension")]
     FirefoxExtension = 3,
+    #[display("Opera Extension")]
     OperaExtension = 4,
+    #[display("Edge Extension")]
     EdgeExtension = 5,
+    #[display("Windows")]
     WindowsDesktop = 6,
+    #[display("macOS")]
     MacOsDesktop = 7,
+    #[display("Linux")]
     LinuxDesktop = 8,
+    #[display("Chrome")]
     ChromeBrowser = 9,
+    #[display("Firefox")]
     FirefoxBrowser = 10,
+    #[display("Opera")]
     OperaBrowser = 11,
+    #[display("Edge")]
     EdgeBrowser = 12,
+    #[display("Internet Explorer")]
     IEBrowser = 13,
+    #[display("Unknown Browser")]
     UnknownBrowser = 14,
+    #[display("Android")]
     AndroidAmazon = 15,
+    #[display("UWP")]
     Uwp = 16,
+    #[display("Safari")]
     SafariBrowser = 17,
+    #[display("Vivaldi")]
     VivaldiBrowser = 18,
+    #[display("Vivaldi Extension")]
     VivaldiExtension = 19,
+    #[display("Safari Extension")]
     SafariExtension = 20,
+    #[display("SDK")]
     Sdk = 21,
+    #[display("Server")]
     Server = 22,
-}
-
-impl fmt::Display for DeviceType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DeviceType::Android => write!(f, "Android"),
-            DeviceType::Ios => write!(f, "iOS"),
-            DeviceType::ChromeExtension => write!(f, "Chrome Extension"),
-            DeviceType::FirefoxExtension => write!(f, "Firefox Extension"),
-            DeviceType::OperaExtension => write!(f, "Opera Extension"),
-            DeviceType::EdgeExtension => write!(f, "Edge Extension"),
-            DeviceType::WindowsDesktop => write!(f, "Windows Desktop"),
-            DeviceType::MacOsDesktop => write!(f, "MacOS Desktop"),
-            DeviceType::LinuxDesktop => write!(f, "Linux Desktop"),
-            DeviceType::ChromeBrowser => write!(f, "Chrome Browser"),
-            DeviceType::FirefoxBrowser => write!(f, "Firefox Browser"),
-            DeviceType::OperaBrowser => write!(f, "Opera Browser"),
-            DeviceType::EdgeBrowser => write!(f, "Edge Browser"),
-            DeviceType::IEBrowser => write!(f, "Internet Explorer"),
-            DeviceType::UnknownBrowser => write!(f, "Unknown Browser"),
-            DeviceType::AndroidAmazon => write!(f, "Android Amazon"),
-            DeviceType::Uwp => write!(f, "UWP"),
-            DeviceType::SafariBrowser => write!(f, "Safari Browser"),
-            DeviceType::VivaldiBrowser => write!(f, "Vivaldi Browser"),
-            DeviceType::VivaldiExtension => write!(f, "Vivaldi Extension"),
-            DeviceType::SafariExtension => write!(f, "Safari Extension"),
-            DeviceType::Sdk => write!(f, "SDK"),
-            DeviceType::Server => write!(f, "Server"),
-        }
-    }
+    #[display("Windows CLI")]
+    WindowsCLI = 23,
+    #[display("macOS CLI")]
+    MacOsCLI = 24,
+    #[display("Linux CLI")]
+    LinuxCLI = 25,
 }
 
 impl DeviceType {
@@ -309,7 +379,15 @@ impl DeviceType {
             20 => DeviceType::SafariExtension,
             21 => DeviceType::Sdk,
             22 => DeviceType::Server,
+            23 => DeviceType::WindowsCLI,
+            24 => DeviceType::MacOsCLI,
+            25 => DeviceType::LinuxCLI,
             _ => DeviceType::UnknownBrowser,
         }
     }
 }
+
+#[derive(
+    Clone, Debug, DieselNewType, Display, From, FromForm, Hash, PartialEq, Eq, Serialize, Deserialize, IdFromParam,
+)]
+pub struct DeviceId(String);

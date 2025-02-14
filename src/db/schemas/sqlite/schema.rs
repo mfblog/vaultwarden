@@ -3,7 +3,7 @@ table! {
         id -> Text,
         cipher_uuid -> Text,
         file_name -> Text,
-        file_size -> Integer,
+        file_size -> BigInt,
         akey -> Nullable<Text>,
     }
 }
@@ -15,6 +15,7 @@ table! {
         updated_at -> Timestamp,
         user_uuid -> Nullable<Text>,
         organization_uuid -> Nullable<Text>,
+        key -> Nullable<Text>,
         atype -> Integer,
         name -> Text,
         notes -> Nullable<Text>,
@@ -159,7 +160,7 @@ table! {
         atype -> Integer,
         enabled -> Bool,
         data -> Text,
-        last_used -> Integer,
+        last_used -> BigInt,
     }
 }
 
@@ -168,8 +169,18 @@ table! {
         user_uuid -> Text,
         device_uuid -> Text,
         device_name -> Text,
+        device_type -> Integer,
         login_time -> Timestamp,
         ip_address -> Text,
+    }
+}
+
+table! {
+    twofactor_duo_ctx (state) {
+        state -> Text,
+        user_email -> Text,
+        nonce -> Text,
+        exp -> BigInt,
     }
 }
 
@@ -215,6 +226,7 @@ table! {
         collection_uuid -> Text,
         read_only -> Bool,
         hide_passwords -> Bool,
+        manage -> Bool,
     }
 }
 
@@ -284,6 +296,7 @@ table! {
         groups_uuid -> Text,
         read_only -> Bool,
         hide_passwords -> Bool,
+        manage -> Bool,
     }
 }
 
